@@ -188,29 +188,47 @@ function Index() {
             </CardHeader>
             <CardContent className="space-y-4">
               <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-                <dt className="text-muted-foreground">PV jusante</dt>
-                <dd className="font-mono text-foreground">
-                  {result.summary.pvA.name} — {result.summary.pvA.elev.toFixed(3)} m
-                </dd>
-                <dt className="text-muted-foreground">PV montante</dt>
-                <dd className="font-mono text-foreground">
-                  {result.summary.pvB.name} — {result.summary.pvB.elev.toFixed(3)} m
-                </dd>
-                <dt className="text-muted-foreground">Comprimento total</dt>
-                <dd className="font-mono text-foreground">
-                  {result.summary.totalLength.toFixed(2)} m
-                </dd>
+                <dt className="text-muted-foreground">Polylines processadas</dt>
+                <dd className="font-mono text-foreground">{result.summary.polylineCount}</dd>
                 <dt className="text-muted-foreground">Estacas geradas</dt>
                 <dd className="font-mono text-foreground">
-                  {result.summary.stakeCount} (a cada {result.summary.stakeSpacing} m)
+                  {result.summary.totalStakes} (a cada {result.summary.stakeSpacing} m)
                 </dd>
                 <dt className="text-muted-foreground">Triangulação</dt>
                 <dd className="font-mono text-foreground">
                   {result.summary.tinTriangles > 0
-                    ? `${result.summary.stakesFromTin}/${result.summary.stakeCount} interpoladas no TIN (${result.summary.tinTriangles} triângulos)`
+                    ? `${result.summary.stakesFromTin}/${result.summary.totalStakes} interpoladas no TIN (${result.summary.tinTriangles} triângulos)`
                     : "não encontrada — Z linear entre PVs"}
                 </dd>
               </dl>
+              <div className="rounded-md border border-border">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 text-left text-xs uppercase tracking-wide text-muted-foreground">
+                    <tr>
+                      <th className="px-3 py-2">#</th>
+                      <th className="px-3 py-2">Jusante</th>
+                      <th className="px-3 py-2">Montante</th>
+                      <th className="px-3 py-2 text-right">Comprimento</th>
+                      <th className="px-3 py-2 text-right">Estacas</th>
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono">
+                    {result.summary.polylines.map((p, i) => (
+                      <tr key={i} className="border-t border-border">
+                        <td className="px-3 py-2 text-muted-foreground">{i + 1}</td>
+                        <td className="px-3 py-2">
+                          {p.pvA.name} ({p.pvA.elev.toFixed(2)})
+                        </td>
+                        <td className="px-3 py-2">
+                          {p.pvB.name} ({p.pvB.elev.toFixed(2)})
+                        </td>
+                        <td className="px-3 py-2 text-right">{p.length.toFixed(2)} m</td>
+                        <td className="px-3 py-2 text-right">{p.stakes}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
               <Button onClick={download} className="w-full">
                 Baixar DXF processado
               </Button>
