@@ -1,0 +1,316 @@
+// DXF processor for estaqueamento generation.
+// Parses pairs (code, value), augments the ENTITIES section, returns new DXF text.
+
+type Pair = [string, string];
+
+interface Entity {
+  type: string;
+  pairs: Pair[];
+}
+
+const PV_LAYER = "PV";
+const POLY_LAYER = "ELEVACAO_05_LINHA_EIXO";
+const OUT_PV_TEXT_LAYER = "ELEVACAO_19_TEXTO_PVS";
+const OUT_REDE_TEXT_LAYER = "ELEVACAO_19_TEXTO_REDE";
+const OUT_STAKE_LAYER = "ELEVACAO_00_ESTACAS";
+const OUT_ARROW_LAYER = "ELEVACAO_34_SETA_FLUXO";
+const ARROW_BLOCK = "seta";
+
+function splitLines(src: string): string[] {
+  return src.split(/\r\n|\r|\n/);
+}
+
+function getPair(e: Entity, code: string): string | undefined {
+  const p = e.pairs.find((x) => x[0] === code);
+  return p?.[1];
+}
+function getAll(e: Entity, code: string): string[] {
+  return e.pairs.filter((x) => x[0] === code).map((x) => x[1]);
+}
+function num(v: string | undefined): number {
+  return v === undefined ? NaN : parseFloat(v);
+}
+
+export interface ProcessResult {
+  dxf: string;
+  summary: {
+    pvA: { name: string; elev: number; x: number; y: number };
+    pvB: { name: string; elev: number; x: number; y: number };
+    totalLength: number;
+    stakeCount: number;
+    stakeSpacing: number;
+  };
+}
+
+export interface ProcessOptions {
+  spacing?: number; // meters between stakes, default 20
+  textHeightPV?: number; // default 1.4
+  textHeightStake?: number; // default 0.5
+  textHeightRede?: number; // default 1.4
+  arrowScale?: number; // default 1
+}
+
+export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResult {
+  const spacing = opts.spacing ?? 20;
+  const hPV = opts.textHeightPV ?? 1.4;
+  const hStake = opts.textHeightStake ?? 0.5;
+  const hRede = opts.textHeightRede ?? 1.4;
+
+  const lines = splitLines(src);
+
+  // Find ENTITIES section bounds
+  let entStart = -1;
+  let entEnd = -1; // index of the ENDSEC group code "0"
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (lines[i].trim() === "2" && lines[i + 1].trim() === "ENTITIES") {
+      // The section starts after the SECTION/2/ENTITIES header.
+      // Move forward to the first group code line after the name.
+      entStart = i + 2;
+      break;
+    }
+  }
+  if (entStart === -1) throw new Error("Seção ENTITIES não encontrada no DXF.");
+  for (let i = entStart; i < lines.length - 1; i++) {
+    if (lines[i].trim() === "0" && lines[i + 1].trim() === "ENDSEC") {
+      entEnd = i;
+      break;
+    }
+  }
+  if (entEnd === -1) throw new Error("Fim da seção ENTITIES não encontrado.");
+
+  // Parse entities between entStart and entEnd
+  const entities: Entity[] = [];
+  let i = entStart;
+  let cur: Entity | null = null;
+  while (i < entEnd) {
+    const code = lines[i]?.trim();
+    const val = lines[i + 1] ?? "";
+    if (code === undefined) break;
+    if (code === "0") {
+      if (cur) entities.push(cur);
+      cur = { type: val.trim(), pairs: [] };
+    } else if (cur) {
+      cur.pairs.push([code, val]);
+    }
+    i += 2;
+  }
+  if (cur) entities.push(cur);
+
+  // Find PV points (POINT entities on layer PV)
+  const pvPoints = entities.filter(
+    (e) => e.type === "POINT" && (getPair(e, "8") ?? "").trim() === PV_LAYER,
+  );
+  if (pvPoints.length < 2) {
+    throw new Error(
+      `Esperado 2 POINTs no layer "${PV_LAYER}", encontrado ${pvPoints.length}.`,
+    );
+  }
+  const pvs = pvPoints.slice(0, 2).map((e) => ({
+    x: num(getPair(e, "10")),
+    y: num(getPair(e, "20")),
+    z: num(getPair(e, "30")),
+  }));
+
+  // Find polyline
+  const poly = entities.find(
+    (e) =>
+      (e.type === "LWPOLYLINE" || e.type === "POLYLINE") &&
+      (getPair(e, "8") ?? "").trim() === POLY_LAYER,
+  );
+  if (!poly) throw new Error(`Polyline no layer "${POLY_LAYER}" não encontrada.`);
+
+  const vxs = getAll(poly, "10").map(num);
+  const vys = getAll(poly, "20").map(num);
+  if (vxs.length < 2) throw new Error("Polyline precisa de ao menos 2 vértices.");
+
+  // Try to find PV names from PV-layer TEXT entities, matching XY proximity.
+  // In source files PV TEXTs are usually attribute-style stacked at the point.
+  const pvTexts = entities.filter(
+    (e) => e.type === "TEXT" && (getPair(e, "8") ?? "").trim() === PV_LAYER,
+  );
+  function findName(px: number, py: number): string | null {
+    let best: { d: number; v: string } | null = null;
+    for (const t of pvTexts) {
+      const tx = num(getPair(t, "10"));
+      const ty = num(getPair(t, "20"));
+      const v = (getPair(t, "1") ?? "").trim();
+      if (!v || v.toUpperCase() === "PV") continue;
+      if (/^[-+]?\d+(\.\d+)?$/.test(v)) continue; // skip elevation number
+      const d = Math.hypot(tx - px, ty - py);
+      if (!best || d < best.d) best = { d, v };
+    }
+    return best && best.d < 5 ? best.v : null;
+  }
+
+  // Determine which PV is at the start (jusante = lowest Z) and end (montante = highest Z)
+  const startV = { x: vxs[0], y: vys[0] };
+  const endV = { x: vxs[vxs.length - 1], y: vys[vys.length - 1] };
+  function nearest(px: number, py: number) {
+    return pvs
+      .map((p, idx) => ({ idx, d: Math.hypot(p.x - px, p.y - py) }))
+      .sort((a, b) => a.d - b.d)[0];
+  }
+  const startPV = pvs[nearest(startV.x, startV.y).idx];
+  const endPV = pvs[nearest(endV.x, endV.y).idx];
+
+  // Cumulative segment lengths
+  const segLen: number[] = [];
+  const cum: number[] = [0];
+  for (let k = 0; k < vxs.length - 1; k++) {
+    const L = Math.hypot(vxs[k + 1] - vxs[k], vys[k + 1] - vys[k]);
+    segLen.push(L);
+    cum.push(cum[k] + L);
+  }
+  const total = cum[cum.length - 1];
+
+  function pointAt(s: number) {
+    // returns {x,y, angle (rad of segment forward)}
+    let k = 0;
+    while (k < segLen.length - 1 && cum[k + 1] < s) k++;
+    const t = segLen[k] === 0 ? 0 : (s - cum[k]) / segLen[k];
+    const x = vxs[k] + (vxs[k + 1] - vxs[k]) * t;
+    const y = vys[k] + (vys[k + 1] - vys[k]) * t;
+    const ang = Math.atan2(vys[k + 1] - vys[k], vxs[k + 1] - vxs[k]);
+    return { x, y, ang };
+  }
+
+  // Generate stakes every `spacing` meters (skip exactly at 0 and at total)
+  const stakes: { n: number; s: number; x: number; y: number; z: number }[] = [];
+  let n = 1;
+  for (let s = spacing; s < total - 1e-6; s += spacing) {
+    const p = pointAt(s);
+    // Linear Z along total length between PV elevations
+    const z = startPV.z + ((endPV.z - startPV.z) * s) / total;
+    stakes.push({ n, s, x: p.x, y: p.y, z });
+    n++;
+  }
+
+  // Determine PV labels (fallback PV1/PV2)
+  const nameStart = findName(startPV.x, startPV.y) ?? "PV-J";
+  const nameEnd = findName(endPV.x, endPV.y) ?? "PV-M";
+
+  // Midpoint for arrow + length text
+  const mid = pointAt(total / 2);
+  // Arrow rotation in DEGREES (DXF INSERT code 50). Use polyline forward angle;
+  // block "seta" is drawn already pointing montante->jusante when inserted with
+  // the polyline's forward direction.
+  const arrowRotDeg = (mid.ang * 180) / Math.PI;
+  // Perpendicular unit vector (left side of forward direction)
+  const perpX = -Math.sin(mid.ang);
+  const perpY = Math.cos(mid.ang);
+
+  // Build new entity text
+  const out: string[] = [];
+
+  function emitText(layer: string, x: number, y: number, z: number, h: number, value: string) {
+    out.push(
+      "  0", "TEXT",
+      "100", "AcDbEntity",
+      "  8", layer,
+      "100", "AcDbText",
+      " 10", String(x),
+      " 20", String(y),
+      " 30", String(z),
+      " 40", String(h),
+      "  1", value,
+      "100", "AcDbText",
+    );
+  }
+  function emitPoint(layer: string, x: number, y: number, z: number) {
+    out.push(
+      "  0", "POINT",
+      "100", "AcDbEntity",
+      "  8", layer,
+      "100", "AcDbPoint",
+      " 10", String(x),
+      " 20", String(y),
+      " 30", String(z),
+    );
+  }
+  function emitInsert(layer: string, block: string, x: number, y: number, rotDeg: number, scale: number) {
+    out.push(
+      "  0", "INSERT",
+      "100", "AcDbEntity",
+      "  8", layer,
+      "100", "AcDbBlockReference",
+      "  2", block,
+      " 10", String(x),
+      " 20", String(y),
+      " 30", "0.0",
+      " 41", String(scale),
+      " 42", String(scale),
+      " 43", String(scale),
+      " 50", String(rotDeg),
+    );
+  }
+
+  // PV name texts — offset 1m perpendicular (left side) of incoming direction
+  // Start PV: use first segment angle
+  const a0 = Math.atan2(vys[1] - vys[0], vxs[1] - vxs[0]);
+  const aN = Math.atan2(
+    vys[vys.length - 1] - vys[vys.length - 2],
+    vxs[vxs.length - 1] - vxs[vxs.length - 2],
+  );
+  const offset = Math.max(0.8, hPV * 0.6);
+  emitText(
+    OUT_PV_TEXT_LAYER,
+    startPV.x + Math.cos(a0) * offset - Math.sin(a0) * offset,
+    startPV.y + Math.sin(a0) * offset + Math.cos(a0) * offset,
+    0,
+    hPV,
+    nameStart,
+  );
+  emitText(
+    OUT_PV_TEXT_LAYER,
+    endPV.x - Math.cos(aN) * offset - Math.sin(aN) * offset,
+    endPV.y - Math.sin(aN) * offset + Math.cos(aN) * offset,
+    0,
+    hPV,
+    nameEnd,
+  );
+
+  // Stakes: POINT 3D + TEXT number, text offset perpendicular (~0.3m)
+  const stakeOff = Math.max(0.3, hStake * 0.6);
+  for (const st of stakes) {
+    emitPoint(OUT_STAKE_LAYER, st.x, st.y, st.z);
+    const p = pointAt(st.s);
+    emitText(
+      OUT_STAKE_LAYER,
+      st.x - Math.sin(p.ang) * stakeOff,
+      st.y + Math.cos(p.ang) * stakeOff,
+      0,
+      hStake,
+      String(st.n),
+    );
+  }
+
+  // Arrow (INSERT) at midpoint
+  emitInsert(OUT_ARROW_LAYER, ARROW_BLOCK, mid.x, mid.y, arrowRotDeg, opts.arrowScale ?? 1);
+
+  // Total length text near arrow, offset perpendicular ~1.5m on left side
+  const labelOff = Math.max(1.5, hRede * 1.1);
+  emitText(
+    OUT_REDE_TEXT_LAYER,
+    mid.x + perpX * labelOff,
+    mid.y + perpY * labelOff,
+    0,
+    hRede,
+    `${total.toFixed(2)}m`,
+  );
+
+  // Inject before entEnd (the "0" line of ENDSEC)
+  const before = lines.slice(0, entEnd);
+  const after = lines.slice(entEnd);
+  const result = [...before, ...out, ...after].join("\n");
+
+  return {
+    dxf: result,
+    summary: {
+      pvA: { name: nameStart, elev: startPV.z, x: startPV.x, y: startPV.y },
+      pvB: { name: nameEnd, elev: endPV.z, x: endPV.x, y: endPV.y },
+      totalLength: total,
+      stakeCount: stakes.length,
+      stakeSpacing: spacing,
+    },
+  };
+}
