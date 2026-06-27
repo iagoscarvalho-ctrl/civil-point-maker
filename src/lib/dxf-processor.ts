@@ -46,6 +46,8 @@ export interface ProcessResult {
     totalLength: number;
     stakeCount: number;
     stakeSpacing: number;
+    tinTriangles: number;
+    stakesFromTin: number;
   };
 }
 
