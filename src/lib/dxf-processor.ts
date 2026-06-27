@@ -16,6 +16,13 @@ const OUT_STAKE_LAYER = "ELEVACAO_00_ESTACAS";
 const OUT_ARROW_LAYER = "ELEVACAO_34_SETA_FLUXO";
 const ARROW_BLOCK = "seta";
 
+// Layer that contains 3DFACE entities forming the TIN. Matched case-insensitively
+// and tolerant of accents (Triangulação / Triangulacao / TRIANGULATION).
+function isTinLayer(name: string): boolean {
+  const n = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  return n.startsWith("triangul");
+}
+
 function splitLines(src: string): string[] {
   return src.split(/\r\n|\r|\n/);
 }
@@ -39,6 +46,8 @@ export interface ProcessResult {
     totalLength: number;
     stakeCount: number;
     stakeSpacing: number;
+    tinTriangles: number;
+    stakesFromTin: number;
   };
 }
 
@@ -163,6 +172,55 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   }
   const total = cum[cum.length - 1];
 
+  // Build TIN from 3DFACE entities on the triangulação layer
+  type Tri = { ax: number; ay: number; az: number; bx: number; by: number; bz: number; cx: number; cy: number; cz: number; minX: number; maxX: number; minY: number; maxY: number };
+  const tris: Tri[] = [];
+  for (const e of entities) {
+    if (e.type !== "3DFACE") continue;
+    if (!isTinLayer((getPair(e, "8") ?? "").trim())) continue;
+    const p0 = [num(getPair(e, "10")), num(getPair(e, "20")), num(getPair(e, "30"))];
+    const p1 = [num(getPair(e, "11")), num(getPair(e, "21")), num(getPair(e, "31"))];
+    const p2 = [num(getPair(e, "12")), num(getPair(e, "22")), num(getPair(e, "32"))];
+    const p3 = [num(getPair(e, "13")), num(getPair(e, "23")), num(getPair(e, "33"))];
+    const pushTri = (a: number[], b: number[], c: number[]) => {
+      if (a.some(isNaN) || b.some(isNaN) || c.some(isNaN)) return;
+      tris.push({
+        ax: a[0], ay: a[1], az: a[2],
+        bx: b[0], by: b[1], bz: b[2],
+        cx: c[0], cy: c[1], cz: c[2],
+        minX: Math.min(a[0], b[0], c[0]),
+        maxX: Math.max(a[0], b[0], c[0]),
+        minY: Math.min(a[1], b[1], c[1]),
+        maxY: Math.max(a[1], b[1], c[1]),
+      });
+    };
+    pushTri(p0, p1, p2);
+    // If 4th corner differs from 3rd, the 3DFACE is a quad; split into 2 tris
+    if (Math.hypot(p3[0] - p2[0], p3[1] - p2[1], p3[2] - p2[2]) > 1e-9) {
+      pushTri(p0, p2, p3);
+    }
+  }
+
+  function interpZ(x: number, y: number): number | null {
+    // Find triangle containing (x,y) via barycentric coords
+    for (const t of tris) {
+      if (x < t.minX || x > t.maxX || y < t.minY || y > t.maxY) continue;
+      const v0x = t.bx - t.ax, v0y = t.by - t.ay;
+      const v1x = t.cx - t.ax, v1y = t.cy - t.ay;
+      const v2x = x - t.ax, v2y = y - t.ay;
+      const den = v0x * v1y - v1x * v0y;
+      if (Math.abs(den) < 1e-12) continue;
+      const v = (v2x * v1y - v1x * v2y) / den;
+      const w = (v0x * v2y - v2x * v0y) / den;
+      const u = 1 - v - w;
+      const eps = -1e-7;
+      if (u >= eps && v >= eps && w >= eps) {
+        return u * t.az + v * t.bz + w * t.cz;
+      }
+    }
+    return null;
+  }
+
   function pointAt(s: number) {
     // returns {x,y, angle (rad of segment forward)}
     let k = 0;
@@ -177,10 +235,18 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   // Generate stakes every `spacing` meters (skip exactly at 0 and at total)
   const stakes: { n: number; s: number; x: number; y: number; z: number }[] = [];
   let n = 1;
+  let interpolatedFromTin = 0;
   for (let s = spacing; s < total - 1e-6; s += spacing) {
     const p = pointAt(s);
-    // Linear Z along total length between PV elevations
-    const z = startPV.z + ((endPV.z - startPV.z) * s) / total;
+    // Prefer Z from TIN (3DFACE triangulation); fallback to linear PV-to-PV.
+    const tinZ = tris.length > 0 ? interpZ(p.x, p.y) : null;
+    let z: number;
+    if (tinZ !== null) {
+      z = tinZ;
+      interpolatedFromTin++;
+    } else {
+      z = startPV.z + ((endPV.z - startPV.z) * s) / total;
+    }
     stakes.push({ n, s, x: p.x, y: p.y, z });
     n++;
   }
@@ -311,6 +377,8 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
       totalLength: total,
       stakeCount: stakes.length,
       stakeSpacing: spacing,
+      tinTriangles: tris.length,
+      stakesFromTin: interpolatedFromTin,
     },
   };
 }

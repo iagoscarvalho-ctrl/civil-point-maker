@@ -204,6 +204,12 @@ function Index() {
                 <dd className="font-mono text-foreground">
                   {result.summary.stakeCount} (a cada {result.summary.stakeSpacing} m)
                 </dd>
+                <dt className="text-muted-foreground">Triangulação</dt>
+                <dd className="font-mono text-foreground">
+                  {result.summary.tinTriangles > 0
+                    ? `${result.summary.stakesFromTin}/${result.summary.stakeCount} interpoladas no TIN (${result.summary.tinTriangles} triângulos)`
+                    : "não encontrada — Z linear entre PVs"}
+                </dd>
               </dl>
               <Button onClick={download} className="w-full">
                 Baixar DXF processado
