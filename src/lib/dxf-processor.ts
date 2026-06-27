@@ -71,18 +71,41 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
 
   const lines = splitLines(src);
 
-  // Find the highest existing handle so we can assign unique ones to new entities.
-  // DXF handles are hex strings on group code 5 (and 105 for DIMSTYLE).
-  let maxHandle = 0;
-  for (let li = 0; li < lines.length - 1; li++) {
-    const c = lines[li].trim();
-    if (c === "5" || c === "105") {
-      const h = parseInt((lines[li + 1] ?? "").trim(), 16);
-      if (!isNaN(h) && h > maxHandle) maxHandle = h;
-    }
+  const eol = src.includes("\r\n") ? "\r\n" : src.includes("\r") ? "\r" : "\n";
+
+  function normalizeHandle(value: string | undefined): string | null {
+    const raw = (value ?? "").trim().toUpperCase();
+    if (!/^[0-9A-F]+$/.test(raw)) return null;
+    return raw.replace(/^0+(?=[0-9A-F])/, "") || "0";
   }
-  if (maxHandle < 0x100) maxHandle = 0xFFFF;
-  const nextHandle = () => (++maxHandle).toString(16).toUpperCase();
+
+  function isHandleCode(code: string): boolean {
+    const n = Number(code.trim());
+    return n === 5 || n === 105 || (n >= 320 && n <= 369) || n === 390 || n === 480 || n === 481;
+  }
+
+  // Reserve handles far above the source HANDSEED and skip every handle/reference
+  // already present. This avoids AutoCAD collisions even in DXFs with stale seeds
+  // or existing high handles such as 6EAB.
+  const usedHandles = new Set<string>();
+  let maxHandle = 0x1000000;
+  for (let li = 0; li < lines.length - 1; li++) {
+    if (!isHandleCode(lines[li])) continue;
+    const normalized = normalizeHandle(lines[li + 1]);
+    if (!normalized) continue;
+    usedHandles.add(normalized);
+    const h = parseInt(normalized, 16);
+    if (!isNaN(h) && h > maxHandle) maxHandle = h;
+  }
+  const nextHandle = () => {
+    let candidate = "";
+    do {
+      maxHandle += 1;
+      candidate = maxHandle.toString(16).toUpperCase();
+    } while (usedHandles.has(candidate));
+    usedHandles.add(candidate);
+    return candidate;
+  };
 
   // Find ENTITIES section bounds
   let entStart = -1;
@@ -121,6 +144,16 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
     i += 2;
   }
   if (cur) entities.push(cur);
+
+  const modelSpaceOwner =
+    entities
+      .map((e) => (getPair(e, "330") ?? "").trim())
+      .find((h) => normalizeHandle(h) !== null) ?? "1F";
+  const textStyle =
+    entities
+      .filter((e) => e.type === "TEXT")
+      .map((e) => (getPair(e, "7") ?? "").trim())
+      .find(Boolean) ?? "Standard";
 
   // Find PV points (POINT entities on layer PV)
   const pvPoints = entities.filter(
@@ -225,9 +258,11 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   const out: string[] = [];
 
   function emitText(layer: string, x: number, y: number, z: number, h: number, value: string) {
+    const safeValue = value.replace(/[\r\n]+/g, " ");
     out.push(
       "  0", "TEXT",
       "  5", nextHandle(),
+      "330", modelSpaceOwner,
       "100", "AcDbEntity",
       "  8", layer,
       "100", "AcDbText",
@@ -235,7 +270,9 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
       " 20", String(y),
       " 30", String(z),
       " 40", String(h),
-      "  1", value,
+      "  1", safeValue,
+      " 50", "0.0",
+      "  7", textStyle,
       "100", "AcDbText",
     );
   }
@@ -243,6 +280,7 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
     out.push(
       "  0", "POINT",
       "  5", nextHandle(),
+      "330", modelSpaceOwner,
       "100", "AcDbEntity",
       "  8", layer,
       "100", "AcDbPoint",
@@ -255,6 +293,7 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
     out.push(
       "  0", "INSERT",
       "  5", nextHandle(),
+      "330", modelSpaceOwner,
       "100", "AcDbEntity",
       "  8", layer,
       "100", "AcDbBlockReference",
@@ -403,7 +442,19 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   // Inject before entEnd (the "0" line of ENDSEC)
   const before = lines.slice(0, entEnd);
   const after = lines.slice(entEnd);
-  const result = [...before, ...out, ...after].join("\n");
+  const finalLines = [...before, ...out, ...after];
+  const nextSeed = (maxHandle + 1).toString(16).toUpperCase();
+  for (let hi = 0; hi < finalLines.length - 3; hi++) {
+    if (finalLines[hi].trim() !== "9" || finalLines[hi + 1].trim() !== "$HANDSEED") continue;
+    for (let hj = hi + 2; hj < Math.min(hi + 20, finalLines.length - 1); hj++) {
+      if (finalLines[hj].trim() === "5") {
+        finalLines[hj + 1] = nextSeed;
+        hi = finalLines.length;
+        break;
+      }
+    }
+  }
+  const result = finalLines.join(eol);
 
   return {
     dxf: result,
