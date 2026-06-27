@@ -41,13 +41,17 @@ function num(v: string | undefined): number {
 export interface ProcessResult {
   dxf: string;
   summary: {
-    pvA: { name: string; elev: number; x: number; y: number };
-    pvB: { name: string; elev: number; x: number; y: number };
-    totalLength: number;
-    stakeCount: number;
+    polylineCount: number;
+    totalStakes: number;
     stakeSpacing: number;
     tinTriangles: number;
     stakesFromTin: number;
+    polylines: Array<{
+      pvA: { name: string; elev: number };
+      pvB: { name: string; elev: number };
+      length: number;
+      stakes: number;
+    }>;
   };
 }
 
@@ -111,26 +115,24 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   );
   if (pvPoints.length < 2) {
     throw new Error(
-      `Esperado 2 POINTs no layer "${PV_LAYER}", encontrado ${pvPoints.length}.`,
+      `Esperado ao menos 2 POINTs no layer "${PV_LAYER}", encontrado ${pvPoints.length}.`,
     );
   }
-  const pvs = pvPoints.slice(0, 2).map((e) => ({
+  const pvs = pvPoints.map((e) => ({
     x: num(getPair(e, "10")),
     y: num(getPair(e, "20")),
     z: num(getPair(e, "30")),
   }));
 
-  // Find polyline
-  const poly = entities.find(
+  // Find ALL polylines on the eixo layer
+  const polys = entities.filter(
     (e) =>
       (e.type === "LWPOLYLINE" || e.type === "POLYLINE") &&
       (getPair(e, "8") ?? "").trim() === POLY_LAYER,
   );
-  if (!poly) throw new Error(`Polyline no layer "${POLY_LAYER}" não encontrada.`);
-
-  const vxs = getAll(poly, "10").map(num);
-  const vys = getAll(poly, "20").map(num);
-  if (vxs.length < 2) throw new Error("Polyline precisa de ao menos 2 vértices.");
+  if (polys.length === 0) {
+    throw new Error(`Nenhuma polyline encontrada no layer "${POLY_LAYER}".`);
+  }
 
   // Try to find PV names from PV-layer TEXT entities, matching XY proximity.
   // In source files PV TEXTs are usually attribute-style stacked at the point.
@@ -151,26 +153,11 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
     return best && best.d < 5 ? best.v : null;
   }
 
-  // Determine which PV is at the start (jusante = lowest Z) and end (montante = highest Z)
-  const startV = { x: vxs[0], y: vys[0] };
-  const endV = { x: vxs[vxs.length - 1], y: vys[vys.length - 1] };
-  function nearest(px: number, py: number) {
+  function nearestPV(px: number, py: number) {
     return pvs
-      .map((p, idx) => ({ idx, d: Math.hypot(p.x - px, p.y - py) }))
+      .map((p, idx) => ({ idx, p, d: Math.hypot(p.x - px, p.y - py) }))
       .sort((a, b) => a.d - b.d)[0];
   }
-  const startPV = pvs[nearest(startV.x, startV.y).idx];
-  const endPV = pvs[nearest(endV.x, endV.y).idx];
-
-  // Cumulative segment lengths
-  const segLen: number[] = [];
-  const cum: number[] = [0];
-  for (let k = 0; k < vxs.length - 1; k++) {
-    const L = Math.hypot(vxs[k + 1] - vxs[k], vys[k + 1] - vys[k]);
-    segLen.push(L);
-    cum.push(cum[k] + L);
-  }
-  const total = cum[cum.length - 1];
 
   // Build TIN from 3DFACE entities on the triangulação layer
   type Tri = { ax: number; ay: number; az: number; bx: number; by: number; bz: number; cx: number; cy: number; cz: number; minX: number; maxX: number; minY: number; maxY: number };
@@ -221,50 +208,6 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
     return null;
   }
 
-  function pointAt(s: number) {
-    // returns {x,y, angle (rad of segment forward)}
-    let k = 0;
-    while (k < segLen.length - 1 && cum[k + 1] < s) k++;
-    const t = segLen[k] === 0 ? 0 : (s - cum[k]) / segLen[k];
-    const x = vxs[k] + (vxs[k + 1] - vxs[k]) * t;
-    const y = vys[k] + (vys[k + 1] - vys[k]) * t;
-    const ang = Math.atan2(vys[k + 1] - vys[k], vxs[k + 1] - vxs[k]);
-    return { x, y, ang };
-  }
-
-  // Generate stakes every `spacing` meters (skip exactly at 0 and at total)
-  const stakes: { n: number; s: number; x: number; y: number; z: number }[] = [];
-  let n = 1;
-  let interpolatedFromTin = 0;
-  for (let s = spacing; s < total - 1e-6; s += spacing) {
-    const p = pointAt(s);
-    // Prefer Z from TIN (3DFACE triangulation); fallback to linear PV-to-PV.
-    const tinZ = tris.length > 0 ? interpZ(p.x, p.y) : null;
-    let z: number;
-    if (tinZ !== null) {
-      z = tinZ;
-      interpolatedFromTin++;
-    } else {
-      z = startPV.z + ((endPV.z - startPV.z) * s) / total;
-    }
-    stakes.push({ n, s, x: p.x, y: p.y, z });
-    n++;
-  }
-
-  // Determine PV labels (fallback PV1/PV2)
-  const nameStart = findName(startPV.x, startPV.y) ?? "PV-J";
-  const nameEnd = findName(endPV.x, endPV.y) ?? "PV-M";
-
-  // Midpoint for arrow + length text
-  const mid = pointAt(total / 2);
-  // Arrow rotation in DEGREES (DXF INSERT code 50). Use polyline forward angle;
-  // block "seta" is drawn already pointing montante->jusante when inserted with
-  // the polyline's forward direction.
-  const arrowRotDeg = (mid.ang * 180) / Math.PI;
-  // Perpendicular unit vector (left side of forward direction)
-  const perpX = -Math.sin(mid.ang);
-  const perpY = Math.cos(mid.ang);
-
   // Build new entity text
   const out: string[] = [];
 
@@ -310,59 +253,136 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
     );
   }
 
-  // PV name texts — offset 1m perpendicular (left side) of incoming direction
-  // Start PV: use first segment angle
-  const a0 = Math.atan2(vys[1] - vys[0], vxs[1] - vxs[0]);
-  const aN = Math.atan2(
-    vys[vys.length - 1] - vys[vys.length - 2],
-    vxs[vxs.length - 1] - vxs[vxs.length - 2],
-  );
   const offset = Math.max(0.8, hPV * 0.6);
-  emitText(
-    OUT_PV_TEXT_LAYER,
-    startPV.x + Math.cos(a0) * offset - Math.sin(a0) * offset,
-    startPV.y + Math.sin(a0) * offset + Math.cos(a0) * offset,
-    0,
-    hPV,
-    nameStart,
-  );
-  emitText(
-    OUT_PV_TEXT_LAYER,
-    endPV.x - Math.cos(aN) * offset - Math.sin(aN) * offset,
-    endPV.y - Math.sin(aN) * offset + Math.cos(aN) * offset,
-    0,
-    hPV,
-    nameEnd,
-  );
-
-  // Stakes: POINT 3D + TEXT number, text offset perpendicular (~0.3m)
   const stakeOff = Math.max(0.3, hStake * 0.6);
-  for (const st of stakes) {
-    emitPoint(OUT_STAKE_LAYER, st.x, st.y, st.z);
-    const p = pointAt(st.s);
-    emitText(
-      OUT_STAKE_LAYER,
-      st.x - Math.sin(p.ang) * stakeOff,
-      st.y + Math.cos(p.ang) * stakeOff,
-      0,
-      hStake,
-      String(st.n),
+  const labelOff = Math.max(1.5, hRede * 1.1);
+
+  // Dedupe PV labels emitted across polylines (a PV may be shared by multiple lines)
+  const emittedPVs = new Set<number>();
+
+  let totalStakes = 0;
+  let interpolatedFromTin = 0;
+  const polySummaries: ProcessResult["summary"]["polylines"] = [];
+
+  for (const poly of polys) {
+    const vxs = getAll(poly, "10").map(num);
+    const vys = getAll(poly, "20").map(num);
+    if (vxs.length < 2) continue;
+
+    // Cumulative segment lengths
+    const segLen: number[] = [];
+    const cum: number[] = [0];
+    for (let k = 0; k < vxs.length - 1; k++) {
+      const L = Math.hypot(vxs[k + 1] - vxs[k], vys[k + 1] - vys[k]);
+      segLen.push(L);
+      cum.push(cum[k] + L);
+    }
+    const total = cum[cum.length - 1];
+    if (total <= 0) continue;
+
+    const pointAt = (s: number) => {
+      let k = 0;
+      while (k < segLen.length - 1 && cum[k + 1] < s) k++;
+      const t = segLen[k] === 0 ? 0 : (s - cum[k]) / segLen[k];
+      const x = vxs[k] + (vxs[k + 1] - vxs[k]) * t;
+      const y = vys[k] + (vys[k + 1] - vys[k]) * t;
+      const ang = Math.atan2(vys[k + 1] - vys[k], vxs[k + 1] - vxs[k]);
+      return { x, y, ang };
+    };
+
+    // Match endpoints to PV POINTs
+    const startNear = nearestPV(vxs[0], vys[0]);
+    const endNear = nearestPV(vxs[vxs.length - 1], vys[vys.length - 1]);
+    if (startNear.d > 5 || endNear.d > 5) {
+      // Endpoints are too far from any PV — skip this polyline (likely not an eixo)
+      continue;
+    }
+    const startPV = startNear.p;
+    const endPV = endNear.p;
+    const nameStart = findName(startPV.x, startPV.y) ?? "PV";
+    const nameEnd = findName(endPV.x, endPV.y) ?? "PV";
+
+    // PV name texts (only once per PV across the file)
+    const a0 = Math.atan2(vys[1] - vys[0], vxs[1] - vxs[0]);
+    const aN = Math.atan2(
+      vys[vys.length - 1] - vys[vys.length - 2],
+      vxs[vxs.length - 1] - vxs[vxs.length - 2],
     );
+    if (!emittedPVs.has(startNear.idx)) {
+      emittedPVs.add(startNear.idx);
+      emitText(
+        OUT_PV_TEXT_LAYER,
+        startPV.x + Math.cos(a0) * offset - Math.sin(a0) * offset,
+        startPV.y + Math.sin(a0) * offset + Math.cos(a0) * offset,
+        0,
+        hPV,
+        nameStart,
+      );
+    }
+    if (!emittedPVs.has(endNear.idx)) {
+      emittedPVs.add(endNear.idx);
+      emitText(
+        OUT_PV_TEXT_LAYER,
+        endPV.x - Math.cos(aN) * offset - Math.sin(aN) * offset,
+        endPV.y - Math.sin(aN) * offset + Math.cos(aN) * offset,
+        0,
+        hPV,
+        nameEnd,
+      );
+    }
+
+    // Stakes
+    let n = 1;
+    let stakesThis = 0;
+    for (let s = spacing; s < total - 1e-6; s += spacing) {
+      const p = pointAt(s);
+      const tinZ = tris.length > 0 ? interpZ(p.x, p.y) : null;
+      const z =
+        tinZ !== null
+          ? (interpolatedFromTin++, tinZ)
+          : startPV.z + ((endPV.z - startPV.z) * s) / total;
+      emitPoint(OUT_STAKE_LAYER, p.x, p.y, z);
+      emitText(
+        OUT_STAKE_LAYER,
+        p.x - Math.sin(p.ang) * stakeOff,
+        p.y + Math.cos(p.ang) * stakeOff,
+        0,
+        hStake,
+        String(n),
+      );
+      n++;
+      stakesThis++;
+    }
+    totalStakes += stakesThis;
+
+    // Arrow + length text at midpoint
+    const mid = pointAt(total / 2);
+    const arrowRotDeg = (mid.ang * 180) / Math.PI;
+    const perpX = -Math.sin(mid.ang);
+    const perpY = Math.cos(mid.ang);
+    emitInsert(OUT_ARROW_LAYER, ARROW_BLOCK, mid.x, mid.y, arrowRotDeg, opts.arrowScale ?? 1);
+    emitText(
+      OUT_REDE_TEXT_LAYER,
+      mid.x + perpX * labelOff,
+      mid.y + perpY * labelOff,
+      0,
+      hRede,
+      `${total.toFixed(2)}m`,
+    );
+
+    polySummaries.push({
+      pvA: { name: nameStart, elev: startPV.z },
+      pvB: { name: nameEnd, elev: endPV.z },
+      length: total,
+      stakes: stakesThis,
+    });
   }
 
-  // Arrow (INSERT) at midpoint
-  emitInsert(OUT_ARROW_LAYER, ARROW_BLOCK, mid.x, mid.y, arrowRotDeg, opts.arrowScale ?? 1);
-
-  // Total length text near arrow, offset perpendicular ~1.5m on left side
-  const labelOff = Math.max(1.5, hRede * 1.1);
-  emitText(
-    OUT_REDE_TEXT_LAYER,
-    mid.x + perpX * labelOff,
-    mid.y + perpY * labelOff,
-    0,
-    hRede,
-    `${total.toFixed(2)}m`,
-  );
+  if (polySummaries.length === 0) {
+    throw new Error(
+      "Nenhuma polyline pôde ser processada (verifique se as extremidades coincidem com POINTs no layer PV).",
+    );
+  }
 
   // Inject before entEnd (the "0" line of ENDSEC)
   const before = lines.slice(0, entEnd);
@@ -372,13 +392,12 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   return {
     dxf: result,
     summary: {
-      pvA: { name: nameStart, elev: startPV.z, x: startPV.x, y: startPV.y },
-      pvB: { name: nameEnd, elev: endPV.z, x: endPV.x, y: endPV.y },
-      totalLength: total,
-      stakeCount: stakes.length,
+      polylineCount: polySummaries.length,
+      totalStakes,
       stakeSpacing: spacing,
       tinTriangles: tris.length,
       stakesFromTin: interpolatedFromTin,
+      polylines: polySummaries,
     },
   };
 }
