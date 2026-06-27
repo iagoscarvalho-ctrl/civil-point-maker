@@ -71,6 +71,19 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
 
   const lines = splitLines(src);
 
+  // Find the highest existing handle so we can assign unique ones to new entities.
+  // DXF handles are hex strings on group code 5 (and 105 for DIMSTYLE).
+  let maxHandle = 0;
+  for (let li = 0; li < lines.length - 1; li++) {
+    const c = lines[li].trim();
+    if (c === "5" || c === "105") {
+      const h = parseInt((lines[li + 1] ?? "").trim(), 16);
+      if (!isNaN(h) && h > maxHandle) maxHandle = h;
+    }
+  }
+  if (maxHandle < 0x100) maxHandle = 0xFFFF;
+  const nextHandle = () => (++maxHandle).toString(16).toUpperCase();
+
   // Find ENTITIES section bounds
   let entStart = -1;
   let entEnd = -1; // index of the ENDSEC group code "0"
@@ -214,6 +227,7 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   function emitText(layer: string, x: number, y: number, z: number, h: number, value: string) {
     out.push(
       "  0", "TEXT",
+      "  5", nextHandle(),
       "100", "AcDbEntity",
       "  8", layer,
       "100", "AcDbText",
@@ -228,6 +242,7 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   function emitPoint(layer: string, x: number, y: number, z: number) {
     out.push(
       "  0", "POINT",
+      "  5", nextHandle(),
       "100", "AcDbEntity",
       "  8", layer,
       "100", "AcDbPoint",
@@ -239,6 +254,7 @@ export function processDxf(src: string, opts: ProcessOptions = {}): ProcessResul
   function emitInsert(layer: string, block: string, x: number, y: number, rotDeg: number, scale: number) {
     out.push(
       "  0", "INSERT",
+      "  5", nextHandle(),
       "100", "AcDbEntity",
       "  8", layer,
       "100", "AcDbBlockReference",
